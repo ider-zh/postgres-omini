@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/social-preview.png" alt="postgres-omini social preview" width="100%">
+</p>
+
 # postgres-omini
 
 PostgreSQL 18 image with these extensions preinstalled and enabled on first database initialization:

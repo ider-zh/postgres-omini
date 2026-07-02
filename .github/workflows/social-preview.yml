@@ -1,0 +1,58 @@
+name: Validate social preview
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/social-preview.png"
+      - "README.md"
+      - ".github/workflows/social-preview.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - ".github/social-preview.png"
+      - "README.md"
+      - ".github/workflows/social-preview.yml"
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate banner asset
+        run: |
+          python3 - <<'PY'
+          import os
+          import struct
+          from pathlib import Path
+
+          image = Path(".github/social-preview.png")
+          readme = Path("README.md")
+
+          if not image.exists():
+              raise SystemExit("missing .github/social-preview.png")
+
+          size = image.stat().st_size
+          if size >= 1_000_000:
+              raise SystemExit(f"social preview should stay under 1MB, got {size} bytes")
+
+          with image.open("rb") as f:
+              if f.read(8) != b"\x89PNG\r\n\x1a\n":
+                  raise SystemExit("social preview must be a PNG")
+              length = struct.unpack(">I", f.read(4))[0]
+              chunk = f.read(4)
+              if chunk != b"IHDR" or length < 8:
+                  raise SystemExit("invalid PNG IHDR")
+              width, height = struct.unpack(">II", f.read(8))
+
+          if (width, height) != (1200, 630):
+              raise SystemExit(f"expected 1200x630, got {width}x{height}")
+
+          head = readme.read_text(encoding="utf-8")[:240]
+          if '.github/social-preview.png' not in head:
+              raise SystemExit("README must show .github/social-preview.png at the top")
+
+          print(f"social preview ok: {width}x{height}, {size} bytes")
+          PY
