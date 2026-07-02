@@ -1,0 +1,27 @@
+services:
+  postgres:
+    build:
+      context: .
+      args:
+        POSTGRES_VERSION: "18"
+        APT_MIRROR: ${APT_MIRROR:-}
+        FETCH_HTTP_PROXY: ${FETCH_HTTP_PROXY:-}
+        FETCH_HTTPS_PROXY: ${FETCH_HTTPS_PROXY:-}
+    image: postgres-omini:local
+    container_name: postgres-omini
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-omini-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  postgres-omini-data:
