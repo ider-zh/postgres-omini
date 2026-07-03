@@ -9,6 +9,7 @@ PostgreSQL 18 image with these extensions preinstalled and enabled on first data
 - `pgvector` for vector similarity search
 - ParadeDB `pg_search` for BM25 full-text search
 - ParadeDB Jieba/Lindera/CJK tokenizers for Chinese BM25 search
+- `timescaledb` for time-series hypertables, compression, and continuous aggregates
 - `pgmq` for Postgres-native message queues
 - `zhparser` with SCWS for PostgreSQL native Chinese full-text search
 
@@ -24,7 +25,7 @@ The init script creates all bundled extensions in the default database:
 ```sql
 SELECT extname, extversion
 FROM pg_extension
-WHERE extname IN ('vector', 'pg_search', 'pgmq', 'zhparser')
+WHERE extname IN ('vector', 'pg_search', 'timescaledb', 'pgmq', 'zhparser')
 ORDER BY extname;
 ```
 
@@ -43,13 +44,31 @@ WITH (key_field='id');
 SELECT id, pdb.score(id) FROM cn_docs WHERE body @@@ '中文搜索';
 ```
 
+TimescaleDB example:
+
+```sql
+CREATE TABLE metrics (
+  time timestamptz NOT NULL,
+  device text NOT NULL,
+  value double precision NOT NULL
+);
+SELECT create_hypertable('metrics', 'time');
+INSERT INTO metrics (time, device, value)
+SELECT now() - (i * interval '1 minute'), 'dev-' || (i % 10), random() * 100
+FROM generate_series(1, 1000) AS i;
+SELECT time_bucket('5 minutes', time) AS bucket, avg(value)
+FROM metrics
+GROUP BY bucket
+ORDER BY bucket DESC;
+```
+
 ## Build
 
 ```bash
 docker build -t postgres-omini:local .
 ```
 
-The default build uses the widely deployed Debian-based `postgres:18` image. It compiles pgvector, PGMQ, SCWS, and zhparser from source, and installs the official ParadeDB `pg_search` Debian package for PostgreSQL 18.
+The default build uses the widely deployed Debian-based `postgres:18` image. It compiles pgvector, PGMQ, SCWS, zhparser, and TimescaleDB from source, and installs the official ParadeDB `pg_search` Debian package for PostgreSQL 18.
 
 If your network needs a proxy or a local Debian mirror:
 
@@ -80,7 +99,7 @@ DOCKER_BUILD_ARGS="--add-host win230:100.119.20.46 --build-arg APT_MIRROR=http:/
   ROWS=100000 ./scripts/benchmark.sh
 ```
 
-The script builds the image, starts a temporary container, tests pgvector, pg_search, pgmq, and Chinese search paths, prints a timing report, then removes the container.
+The script builds the image, starts a temporary container, tests pgvector, pg_search, pgmq, TimescaleDB, and Chinese search paths, prints a timing report, then removes the container.
 
 ## Published image
 

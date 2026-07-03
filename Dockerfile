@@ -5,6 +5,7 @@ ARG PGMQ_VERSION=v1.11.1
 ARG PG_SEARCH_VERSION=0.24.1
 ARG SCWS_VERSION=1.2.3
 ARG ZHPARSER_VERSION=v2.3
+ARG TIMESCALEDB_VERSION=2.28.2
 ARG DEBIAN_CODENAME=trixie
 ARG TARGETARCH=amd64
 
@@ -16,6 +17,7 @@ ARG PGMQ_VERSION
 ARG PG_SEARCH_VERSION
 ARG SCWS_VERSION
 ARG ZHPARSER_VERSION
+ARG TIMESCALEDB_VERSION
 ARG DEBIAN_CODENAME
 ARG TARGETARCH
 ARG FETCH_HTTP_PROXY=
@@ -39,6 +41,11 @@ RUN set -eux; \
       git \
       libtool \
       pkg-config \
+      cmake \
+      libssl-dev \
+      libkrb5-dev \
+      libcurl4-openssl-dev \
+      libicu-dev \
       postgresql-server-dev-${POSTGRES_VERSION}; \
     rm -rf /var/lib/apt/lists/*
 
@@ -96,6 +103,16 @@ RUN set -eux; \
     make -C pgmq/pgmq-extension install PG_CONFIG=/usr/bin/pg_config
 
 RUN set -eux; \
+    export http_proxy="${FETCH_HTTP_PROXY}" https_proxy="${FETCH_HTTPS_PROXY}" \
+      HTTP_PROXY="${FETCH_HTTP_PROXY}" HTTPS_PROXY="${FETCH_HTTPS_PROXY}"; \
+    git clone --depth 1 --branch "${TIMESCALEDB_VERSION}" https://github.com/timescale/timescaledb.git; \
+    cd timescaledb; \
+    ./bootstrap -DPG_CONFIG=/usr/bin/pg_config -DCMAKE_BUILD_TYPE=Release; \
+    cd build; \
+    make -j"$(nproc)"; \
+    make install
+
+RUN set -eux; \
     mkdir -p /opt/omni/lib/postgresql /opt/omni/share/postgresql/extension \
       /opt/omni/share/postgresql/tsearch_data /opt/omni/lib /opt/omni/etc; \
     cp "$(pg_config --pkglibdir)/vector.so" /opt/omni/lib/postgresql/; \
@@ -108,6 +125,8 @@ RUN set -eux; \
     cp "$(pg_config --sharedir)/extension"/pg_search* /opt/omni/share/postgresql/extension/; \
     cp "$(pg_config --sharedir)/extension"/zhparser* /opt/omni/share/postgresql/extension/; \
     cp "$(pg_config --sharedir)/extension"/pgmq* /opt/omni/share/postgresql/extension/; \
+    cp "$(pg_config --pkglibdir)"/timescaledb*.so /opt/omni/lib/postgresql/; \
+    cp "$(pg_config --sharedir)/extension"/timescaledb* /opt/omni/share/postgresql/extension/; \
     strip --strip-unneeded /opt/omni/lib/postgresql/*.so /opt/omni/lib/libscws.so.*.*.* || true; \
     libscws_target="$(basename "$(find /opt/omni/lib -maxdepth 1 -name 'libscws.so.*.*.*' | sort | head -n 1)")"; \
     ln -sf "${libscws_target}" /opt/omni/lib/libscws.so.1; \
@@ -121,7 +140,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LD_LIBRARY_PATH=/usr/local/lib
 
 LABEL org.opencontainers.image.title="postgres-omini" \
-      org.opencontainers.image.description="PostgreSQL 18 with pgvector, ParadeDB pg_search, PGMQ, and Chinese text segmentation preinstalled" \
+      org.opencontainers.image.description="PostgreSQL 18 with pgvector, ParadeDB pg_search, PGMQ, TimescaleDB, and Chinese text segmentation preinstalled" \
       org.opencontainers.image.source="https://github.com/ider-zh/postgres-omini" \
       org.opencontainers.image.licenses="PostgreSQL AND AGPL-3.0"
 
@@ -130,7 +149,14 @@ RUN set -eux; \
       sed -i "s|http://deb.debian.org/debian|${APT_MIRROR}|g; s|http://security.debian.org/debian-security|${APT_MIRROR}-security|g" /etc/apt/sources.list.d/debian.sources; \
     fi; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates; \
+    apt-get install -y --no-install-recommends \
+      ca-certificates \
+      libssl3 \
+      libkrb5-3 \
+      libcurl4 \
+      liblz4-1 \
+      libzstd1 \
+      libicu76; \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/omni/lib/postgresql/ /usr/lib/postgresql/18/lib/
@@ -141,7 +167,7 @@ COPY --from=builder /opt/omni/share/postgresql/tsearch_data/ /usr/share/postgres
 COPY docker-entrypoint-initdb.d/ /docker-entrypoint-initdb.d/
 
 RUN ldconfig /usr/local/lib; \
-    echo "shared_preload_libraries = 'pg_search'" >> /usr/share/postgresql/18/postgresql.conf.sample
+    echo "shared_preload_libraries = 'pg_search,timescaledb'" >> /usr/share/postgresql/18/postgresql.conf.sample
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=5 \
   CMD pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" || exit 1

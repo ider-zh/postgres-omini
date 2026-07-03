@@ -53,6 +53,7 @@ echo "loading benchmark data (${ROWS} rows)..."
 "${PSQL[@]}" >/dev/null <<SQL
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_search;
+CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE EXTENSION IF NOT EXISTS pgmq;
 CREATE EXTENSION IF NOT EXISTS zhparser;
 
@@ -115,6 +116,21 @@ CREATE INDEX bench_cn_docs_bm25_idx ON bench_cn_docs USING bm25 (id, (body::pdb.
 SELECT pgmq.create('bench_queue');
 SELECT pgmq.send('bench_queue', jsonb_build_object('id', gs, 'payload', 'benchmark message ' || gs))
 FROM generate_series(1, ${ROWS}) AS gs;
+
+DROP TABLE IF EXISTS bench_metrics;
+CREATE TABLE bench_metrics (
+  time timestamptz NOT NULL,
+  device text NOT NULL,
+  value double precision NOT NULL
+);
+SELECT create_hypertable('bench_metrics', 'time');
+CREATE INDEX bench_metrics_device_time_idx ON bench_metrics (device, time DESC);
+
+INSERT INTO bench_metrics (time, device, value)
+SELECT now() - (gs * interval '1 second'),
+       'dev-' || (gs % 100),
+       random() * 100
+FROM generate_series(1, ${ROWS}) AS gs;
 SQL
 
 echo
@@ -128,10 +144,12 @@ time_sql "pg_search jieba cn match" "SELECT id, pdb.score(id) FROM bench_cn_docs
 time_sql "zhparser gin cn match" "SELECT count(*) FROM bench_cn_docs WHERE body_tsv @@ plainto_tsquery('chinese', '中文搜索');"
 time_sql "pgmq read 100" "SELECT count(*) FROM pgmq.read('bench_queue', 30, 100);"
 time_sql "pgmq pop 100" "SELECT count(*) FROM generate_series(1, 100), LATERAL pgmq.pop('bench_queue');"
+time_sql "timescaledb time_bucket 1m" "SELECT time_bucket('1 minute', time) AS bucket, avg(value) FROM bench_metrics WHERE time > now() - interval '1 hour' GROUP BY bucket ORDER BY bucket DESC LIMIT 10;"
+time_sql "timescaledb last point per device" "SELECT DISTINCT ON (device) device, time, value FROM bench_metrics ORDER BY device, time DESC LIMIT 100;"
 
 echo
 echo "installed extensions:"
-"${PSQL[@]}" -At -c "SELECT extname || ' ' || extversion FROM pg_extension WHERE extname IN ('vector','pg_search','pgmq','zhparser') ORDER BY extname;"
+"${PSQL[@]}" -At -c "SELECT extname || ' ' || extversion FROM pg_extension WHERE extname IN ('vector','pg_search','timescaledb','pgmq','zhparser') ORDER BY extname;"
 
 echo
 echo "cleaning up..."
