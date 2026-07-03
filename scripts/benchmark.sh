@@ -22,7 +22,11 @@ require docker
 
 cleanup
 read -r -a BUILD_ARGS <<< "${DOCKER_BUILD_ARGS:-}"
-docker build -q "${BUILD_ARGS[@]}" -t "${IMAGE}" . >/dev/null
+if [ "${SKIP_BUILD:-0}" = "1" ]; then
+  echo "SKIP_BUILD=1: using existing image ${IMAGE}"
+else
+  docker build -q "${BUILD_ARGS[@]}" -t "${IMAGE}" . >/dev/null
+fi
 docker run -d --name "${CONTAINER}" \
   -e POSTGRES_PASSWORD="${POSTGRES_PASSWORD}" \
   -p 55432:5432 \
