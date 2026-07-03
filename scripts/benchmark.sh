@@ -21,31 +21,47 @@ require() {
 require docker
 
 cleanup
+echo "==> building benchmark image (${IMAGE})..." >&2
 read -r -a BUILD_ARGS <<< "${DOCKER_BUILD_ARGS:-}"
 if [ "${SKIP_BUILD:-0}" = "1" ]; then
-  echo "SKIP_BUILD=1: using existing image ${IMAGE}"
+  echo "SKIP_BUILD=1: using existing image ${IMAGE}" >&2
 else
-  docker build -q "${BUILD_ARGS[@]}" -t "${IMAGE}" . >/dev/null
+  docker build --progress=plain "${BUILD_ARGS[@]}" -t "${IMAGE}" . >&2
 fi
+
+echo "==> starting container ${CONTAINER}..." >&2
 docker run -d --name "${CONTAINER}" \
   -e POSTGRES_PASSWORD="${POSTGRES_PASSWORD}" \
   -p 55432:5432 \
   "${IMAGE}" >/dev/null
 
-echo "waiting for postgres..."
-for _ in $(seq 1 60); do
+echo -n "==> waiting for postgres to be ready" >&2
+ready=false
+for i in $(seq 1 60); do
   if docker exec "${CONTAINER}" pg_isready -h 127.0.0.1 -U postgres -d postgres >/dev/null 2>&1; then
+    ready=true
     break
+  fi
+  if [ $((i % 5)) -eq 0 ]; then
+    echo -n " (${i}s)" >&2
+  else
+    echo -n "." >&2
   fi
   sleep 1
 done
+echo "" >&2
+if [ "${ready}" != "true" ]; then
+  echo "error: postgres did not become ready within 60 seconds" >&2
+  exit 1
+fi
 
-PSQL=(docker exec -i -e PGOPTIONS="-c client_min_messages=warning" "${CONTAINER}" psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -X -q)
+PSQL=(docker exec -i -e PGOPTIONS="-c client_min_messages=notice" "${CONTAINER}" psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -v ROWS="${ROWS}" -X -q)
 
 time_sql() {
   local label="$1"
   local sql="$2"
   local start end ms
+  echo -n "==> running ${label}..." >&2
   start="$(date +%s%3N)"
   "${PSQL[@]}" -c "${sql}" >/dev/null
   end="$(date +%s%3N)"
@@ -53,15 +69,21 @@ time_sql() {
   printf '%-34s %8s ms\n' "${label}" "${ms}"
 }
 
-echo "loading benchmark data (${ROWS} rows)..."
-"${PSQL[@]}" >/dev/null <<SQL
+echo "==> loading benchmark data (${ROWS} rows)..." >&2
+"${PSQL[@]}" >/dev/null <<'SQL'
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_search;
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE EXTENSION IF NOT EXISTS pgmq;
 CREATE EXTENSION IF NOT EXISTS zhparser;
 
-DO \$\$
+CREATE OR REPLACE FUNCTION _bench_notice(msg text) RETURNS void AS $$
+BEGIN
+  RAISE NOTICE '%', msg;
+END
+$$ LANGUAGE plpgsql;
+
+DO $$
 BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_ts_config WHERE cfgname = 'chinese'
@@ -70,8 +92,9 @@ BEGIN
     ALTER TEXT SEARCH CONFIGURATION chinese ADD MAPPING FOR n,v,a,i,e,l WITH simple;
   END IF;
 END
-\$\$;
+$$;
 
+SELECT _bench_notice('creating bench_docs table');
 DROP TABLE IF EXISTS bench_docs;
 CREATE TABLE bench_docs (
   id bigserial PRIMARY KEY,
@@ -81,6 +104,7 @@ CREATE TABLE bench_docs (
   embedding vector(3) NOT NULL
 );
 
+SELECT _bench_notice(format('inserting %s rows into bench_docs', :ROWS));
 INSERT INTO bench_docs (title, body, category, embedding)
 SELECT
   'doc ' || gs,
@@ -93,8 +117,9 @@ SELECT
   END || ' row ' || gs,
   'cat-' || (gs % 10),
   ARRAY[(gs % 100)::float4 / 100, (gs % 50)::float4 / 50, (gs % 25)::float4 / 25]::vector(3)
-FROM generate_series(1, ${ROWS}) AS gs;
+FROM generate_series(1, :ROWS) AS gs;
 
+SELECT _bench_notice('creating bench_cn_docs table');
 DROP TABLE IF EXISTS bench_cn_docs;
 CREATE TABLE bench_cn_docs (
   id bigserial PRIMARY KEY,
@@ -102,6 +127,7 @@ CREATE TABLE bench_cn_docs (
   body_tsv tsvector GENERATED ALWAYS AS (to_tsvector('chinese', body)) STORED
 );
 
+SELECT _bench_notice(format('inserting %s rows into bench_cn_docs', :ROWS));
 INSERT INTO bench_cn_docs (body)
 SELECT
   CASE
@@ -110,17 +136,22 @@ SELECT
     WHEN gs % 4 = 2 THEN '混合搜索 结合 BM25 关键词 和 语义向量'
     ELSE '容器镜像 开箱即用 轻量化 部署'
   END || ' 文档 ' || gs
-FROM generate_series(1, ${ROWS}) AS gs;
+FROM generate_series(1, :ROWS) AS gs;
 
+SELECT _bench_notice('creating indexes on bench_docs');
 CREATE INDEX bench_docs_embedding_hnsw ON bench_docs USING hnsw (embedding vector_l2_ops);
 CREATE INDEX bench_docs_search_idx ON bench_docs USING bm25 (id, title, body, category) WITH (key_field='id');
+
+SELECT _bench_notice('creating indexes on bench_cn_docs');
 CREATE INDEX bench_cn_docs_zhparser_idx ON bench_cn_docs USING gin (body_tsv);
 CREATE INDEX bench_cn_docs_bm25_idx ON bench_cn_docs USING bm25 (id, (body::pdb.jieba)) WITH (key_field='id');
 
+SELECT _bench_notice(format('creating pgmq queue and sending %s messages', :ROWS));
 SELECT pgmq.create('bench_queue');
 SELECT pgmq.send('bench_queue', jsonb_build_object('id', gs, 'payload', 'benchmark message ' || gs))
-FROM generate_series(1, ${ROWS}) AS gs;
+FROM generate_series(1, :ROWS) AS gs;
 
+SELECT _bench_notice('creating bench_metrics hypertable');
 DROP TABLE IF EXISTS bench_metrics;
 CREATE TABLE bench_metrics (
   time timestamptz NOT NULL,
@@ -130,11 +161,15 @@ CREATE TABLE bench_metrics (
 SELECT create_hypertable('bench_metrics', 'time');
 CREATE INDEX bench_metrics_device_time_idx ON bench_metrics (device, time DESC);
 
+SELECT _bench_notice(format('inserting %s rows into bench_metrics', :ROWS));
 INSERT INTO bench_metrics (time, device, value)
 SELECT now() - (gs * interval '1 second'),
        'dev-' || (gs % 100),
        random() * 100
-FROM generate_series(1, ${ROWS}) AS gs;
+FROM generate_series(1, :ROWS) AS gs;
+
+SELECT _bench_notice('data loading complete');
+DROP FUNCTION IF EXISTS _bench_notice(text);
 SQL
 
 echo
