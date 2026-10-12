@@ -1,4 +1,4 @@
-name: Build and publish image
+name: Build, test and publish image
 
 on:
   push:
@@ -10,19 +10,83 @@ on:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/postgres-omini
+  TEST_IMAGE: postgres-omini:ci
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v5
 
-      - uses: docker/setup-qemu-action@v3
-
       - uses: docker/setup-buildx-action@v3
+
+      - name: Check shell scripts
+        run: |
+          for script in scripts/*.sh docker-healthcheck.sh; do
+            bash -n "$script"
+          done
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: latest=false
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=long
+
+      - name: Build and load the candidate image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.TEST_IMAGE }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record the candidate image and component versions
+        run: |
+          mkdir -p artifacts
+          docker image inspect "$TEST_IMAGE" > artifacts/image-inspect.json
+          docker run --rm --entrypoint cat "$TEST_IMAGE" \
+            /usr/share/doc/postgres-omini/components.tsv | tee artifacts/components.tsv
+
+      - name: Test initialization, extension behavior and persistent data
+        env:
+          POSTGRES_OMINI_IMAGE: ${{ env.TEST_IMAGE }}
+        run: ./scripts/smoke-test.sh 2>&1 | tee artifacts/smoke-test.log
+
+      - name: Check the synthetic benchmark and queue assertions
+        env:
+          IMAGE: ${{ env.TEST_IMAGE }}
+          SKIP_BUILD: "1"
+          ROWS: "1000"
+          REPEATS: "3"
+          WARMUP: "1"
+        run: ./scripts/benchmark.sh 2>&1 | tee artifacts/benchmark.log
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -32,24 +96,86 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-
+      # Push the exact local image that passed both tests; do not rebuild it.
+      - name: Publish the tested image
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker tag "$TEST_IMAGE" "$tag"
+            docker push "$tag"
+          done <<< "$IMAGE_TAGS"
+          docker image inspect --format '{{json .RepoDigests}}' "$TEST_IMAGE" \
+            | tee artifacts/repo-digests.json
 
-      - name: Build and optionally push
-        uses: docker/build-push-action@v6
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          context: .
-          platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          name: validation-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  correct-legacy-release-note:
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'ider-zh/postgres-omini'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      # This is an idempotent correction of the known inaccurate description.
+      # It neither moves the historical tag nor creates a new release.
+      - name: Correct the v18.4.1 TimescaleDB description
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          base = f"https://api.github.com/repos/{repo}"
+          headers = {
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def request(path, payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              req = urllib.request.Request(
+                  base + path, data=data, headers=headers,
+                  method="GET" if payload is None else "PATCH",
+              )
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.load(response)
+
+          release = request("/releases/tags/v18.4.1")
+          tag = request("/git/ref/tags/v18.4.1")
+          old_body = "Add TimescaleDB extension. PostgreSQL 18 image."
+          old_sha = "43889438aa38b84add34496588c6ace3fd318b52"
+          if tag["object"]["sha"] != old_sha:
+              print("Historical tag changed; automatic note correction skipped.")
+          elif (release.get("body") or "").strip() != old_body:
+              print("Release description already differs; no change needed.")
+          else:
+              body = (
+                  "PostgreSQL 18 image with pgvector, ParadeDB pg_search, PGMQ, "
+                  "and zhparser/SCWS Chinese text search.\n\n"
+                  "**Correction:** This tag points to commit `43889438` and does "
+                  "not include TimescaleDB. The original release description "
+                  "incorrectly claimed that it did. TimescaleDB was added in "
+                  "the subsequent commit `ec5e3918`.\n\n"
+                  "The historical tag is unchanged. For the current extension "
+                  "bundle, use a later validated image and pin its digest or "
+                  "commit tag. See the repository README and upgrade guide."
+              )
+              request(f"/releases/{release['id']}", {"body": body})
+              print("Corrected v18.4.1 release description; tag unchanged.")
+          PY
+

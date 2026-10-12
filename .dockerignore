@@ -5,3 +5,14 @@ docker-compose.yml
 scripts
 *.log
 tmp
+.env
+.env.*
+!.env.example
+artifacts
+tests
+docs
+CHANGELOG.md
+THIRD_PARTY_NOTICES.md
+backup-*
+*.dump
+

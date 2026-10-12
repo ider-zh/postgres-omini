@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+artifacts/
+*.log
+*.dump
+backup*.sql
+backup-*/
